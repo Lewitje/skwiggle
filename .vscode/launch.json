@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Run Skwiggle (debug)",
+      "cargo": {
+        "args": ["build", "--bin=skwiggle"],
+        "filter": { "name": "skwiggle", "kind": "bin" }
+      },
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Run Skwiggle (release)",
+      "cargo": {
+        "args": ["build", "--release", "--bin=skwiggle"],
+        "filter": { "name": "skwiggle", "kind": "bin" }
+      },
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
