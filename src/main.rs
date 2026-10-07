@@ -3,9 +3,13 @@ mod calc;
 mod components;
 mod contrast;
 mod ecs;
+mod glass;
+#[cfg(target_os = "macos")]
+mod menu;
 mod paint;
 mod paint_editor;
 mod resources;
+mod scrub;
 mod systems;
 mod widgets;
 mod world;
@@ -22,6 +26,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Skwiggle",
         options,
-        Box::new(|_cc| Ok(Box::new(app::SkwiggleApp::default()))),
+        Box::new(|cc| {
+            glass::init(cc.wgpu_render_state.as_ref());
+            Ok(Box::new(app::SkwiggleApp::new(&cc.egui_ctx)))
+        }),
     )
 }

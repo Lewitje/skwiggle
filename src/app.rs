@@ -1,17 +1,20 @@
 use std::path::PathBuf;
 
 use eframe::egui::{
-    self, Color32, CursorIcon, DragValue, FontId, Key, Modifiers, Painter, PointerButton, Pos2,
-    Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2,
+    self, Color32, CursorIcon, FontId, Key, Modifiers, Painter, PointerButton, Pos2, Rect, Sense,
+    Stroke, StrokeKind, Vec2, pos2, vec2,
 };
 
 use crate::calc;
-use crate::components::{Hidden, Parent, ShapeKind};
+use crate::components::{Anchor, Hidden, Parent, ShapeKind, Transform};
+use egui::emath::Rot2;
 use crate::contrast;
+use crate::glass;
 use crate::ecs::Entity;
 use crate::paint::PaintCache;
 use crate::paint_editor;
 use crate::resources::{Background, Shimmer, SnapSettings, snap, snap_pos};
+use crate::scrub::Scrub;
 use crate::systems::render;
 use crate::widgets::{self, Glyph, number_tile};
 use crate::world::World;
@@ -21,6 +24,10 @@ const GUIDE: Color32 = Color32::from_rgb(242, 72, 34);
 /// How close (in screen pixels) an edge must be to snap to another shape.
 const GUIDE_SNAP: f32 = 6.0;
 const HANDLE_SIZE: f32 = 8.0;
+/// How far outside a corner (in screen pixels) dragging rotates instead of resizing.
+const ROTATE_ZONE: f32 = 20.0;
+/// Shift-drag rotation snaps to multiples of this many degrees.
+const ROTATE_SNAP: f32 = 15.0;
 /// Screen gap between the entity toolbar and its entity, clearing frame labels and the size badge.
 const TOOLBAR_GAP: f32 = 30.0;
 const MAX_UNDO: usize = 200;
@@ -32,16 +39,14 @@ pub enum Tool {
     Rect,
     Ellipse,
     Text,
-    Hand,
 }
 
-const TOOLS: [Tool; 6] = [
+const TOOLS: [Tool; 5] = [
     Tool::Select,
     Tool::Frame,
     Tool::Rect,
     Tool::Ellipse,
     Tool::Text,
-    Tool::Hand,
 ];
 
 impl Tool {
@@ -62,7 +67,16 @@ impl Tool {
             Tool::Rect => "Rectangle",
             Tool::Ellipse => "Ellipse",
             Tool::Text => "Text",
-            Tool::Hand => "Hand",
+        }
+    }
+
+    fn icon(self) -> widgets::ToolIcon {
+        match self {
+            Tool::Select => widgets::ToolIcon::Move,
+            Tool::Frame => widgets::ToolIcon::Frame,
+            Tool::Rect => widgets::ToolIcon::Rect,
+            Tool::Ellipse => widgets::ToolIcon::Ellipse,
+            Tool::Text => widgets::ToolIcon::Text,
         }
     }
 
@@ -73,7 +87,6 @@ impl Tool {
             Tool::Rect => Key::R,
             Tool::Ellipse => Key::O,
             Tool::Text => Key::T,
-            Tool::Hand => Key::H,
         }
     }
 }
@@ -141,6 +154,15 @@ enum Drag {
         id: Entity,
         start: Pos2,
     },
+    Rotate {
+        id: Entity,
+        /// World-space pivot, the shape's centre.
+        center: Pos2,
+        /// Pointer angle (radians) when the drag began.
+        start: f32,
+        /// Rotation (degrees) when the drag began.
+        original: f32,
+    },
     Marquee {
         start: Pos2,
         base: Vec<Entity>,
@@ -162,14 +184,26 @@ pub struct SkwiggleApp {
     focus_text: bool,
     /// True while a run of edits in the properties panel shares one undo entry.
     panel_edit: bool,
-    status: String,
+    /// Timestamps of frames painted in the last second, for the FPS readout.
+    frame_times: std::collections::VecDeque<f64>,
+    /// Window title last sent to the OS.
+    title: String,
     alignment: Alignment,
     /// Textures for gradient and image fills.
     paints: PaintCache,
     /// True while a panel value is being dragged, so the canvas shows guides for it.
     scrubbing: bool,
+    /// Entity toolbar placement, held still while the pointer is down.
+    toolbar_pin: Option<(Vec<Entity>, Pos2, egui::Align2)>,
     /// Shimmer animation time, advanced by `shimmer.speed` each frame.
     shimmer_clock: f32,
+    /// Widths of the floating layers and properties panels.
+    panel_widths: [f32; 2],
+    glass: glass::Settings,
+    /// Whether glass rendered last frame; the floating toolbars fall back to flat otherwise.
+    glass_live: bool,
+    #[cfg(target_os = "macos")]
+    menu: Option<std::rc::Rc<crate::menu::NativeMenu>>,
 }
 
 impl Default for SkwiggleApp {
@@ -187,28 +221,99 @@ impl Default for SkwiggleApp {
             editing_text: None,
             focus_text: false,
             panel_edit: false,
-            status: String::new(),
+            title: String::new(),
+            frame_times: Default::default(),
             alignment: Alignment::default(),
             paints: PaintCache::default(),
             scrubbing: false,
+            toolbar_pin: None,
             shimmer_clock: 0.0,
+            panel_widths: [220.0, 260.0],
+            glass: glass::Settings::default(),
+            glass_live: false,
+            #[cfg(target_os = "macos")]
+            menu: None,
+        }
+    }
+}
+
+impl SkwiggleApp {
+    pub fn new(ctx: &egui::Context) -> Self {
+        #[cfg(not(target_os = "macos"))]
+        let _ = ctx;
+        Self {
+            #[cfg(target_os = "macos")]
+            menu: crate::menu::NativeMenu::install(ctx).map(std::rc::Rc::new),
+            ..Self::default()
+        }
+    }
+
+    /// Runs commands picked from the native menu bar.
+    fn menu_commands(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::menu::Command;
+            let Some(menu) = &self.menu else { return };
+            menu.set_history(!self.undo.is_empty(), !self.redo.is_empty());
+            let picked = menu.poll();
+            let typing = ctx.egui_wants_keyboard_input();
+            for c in picked {
+                match c {
+                    Command::New => self.new_doc(),
+                    Command::Open => self.open(),
+                    Command::Save => self.save(false),
+                    Command::SaveAs => self.save(true),
+                    // Text fields keep ⌘Z for their own undo.
+                    Command::Undo if !typing => self.undo(),
+                    Command::Redo if !typing => self.redo(),
+                    Command::Undo | Command::Redo => {}
+                }
+            }
+        }
+    }
+
+    /// Shows the open file's name in the window title.
+    fn sync_title(&mut self, ctx: &egui::Context) {
+        let name = self.path.as_ref().and_then(|p| p.file_stem()).map(|n| n.to_string_lossy());
+        let title = match name {
+            Some(n) => format!("{n} — Skwiggle"),
+            None => "Skwiggle".to_owned(),
+        };
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+    }
+
+    /// Clears to a blank document, keeping app-level state like the menu bar.
+    fn reset(&mut self) {
+        #[cfg(target_os = "macos")]
+        let menu = self.menu.take();
+        *self = Self::default();
+        #[cfg(target_os = "macos")]
+        {
+            self.menu = menu;
         }
     }
 }
 
 impl eframe::App for SkwiggleApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         calc::begin_frame(ui.ctx());
+        let now = ui.input(|i| i.time);
+        self.frame_times.push_back(now);
+        while self.frame_times.front().is_some_and(|&t| now - t > 1.0) {
+            self.frame_times.pop_front();
+        }
+        self.menu_commands(ui.ctx());
         self.shortcuts(ui.ctx());
 
-        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
-        egui::Panel::left("layers")
-            .default_size(220.0)
-            .show(ui, |ui| self.layers_panel(ui));
-        egui::Panel::right("properties")
-            .default_size(260.0)
-            .show(ui, |ui| self.coalesce_edits(|app| app.properties_panel(ui)));
-        egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
+        self.sync_title(ui.ctx());
+        let canvas = egui::CentralPanel::no_frame()
+            .show(ui, |ui| self.canvas(ui))
+            .response;
+        self.floating_panels(ui.ctx(), frame, canvas.rect, canvas.layer_id);
+        self.tools_bar(ui.ctx(), canvas.rect);
 
         // A run of direct edits ends once the pointer and keyboard are let go.
         let ctx = ui.ctx();
@@ -342,7 +447,7 @@ impl SkwiggleApp {
     }
 
     fn new_doc(&mut self) {
-        *self = Self::default();
+        self.reset();
     }
 
     fn open(&mut self) {
@@ -354,12 +459,11 @@ impl SkwiggleApp {
         };
         match World::load(&path) {
             Ok(doc) => {
-                *self = Self::default();
+                self.reset();
                 self.world = doc;
-                self.status = format!("Opened {}", path.display());
                 self.path = Some(path);
             }
-            Err(e) => self.status = format!("Open failed: {e}"),
+            Err(e) => error_dialog("Couldn’t open the file", &e.to_string()),
         }
     }
 
@@ -376,11 +480,8 @@ impl SkwiggleApp {
             },
         };
         match self.world.save(&path) {
-            Ok(()) => {
-                self.status = format!("Saved {}", path.display());
-                self.path = Some(path);
-            }
-            Err(e) => self.status = format!("Save failed: {e}"),
+            Ok(()) => self.path = Some(path),
+            Err(e) => error_dialog("Couldn’t save the file", &e.to_string()),
         }
     }
 
@@ -467,60 +568,152 @@ impl SkwiggleApp {
 // ---------------------------------------------------------------------------
 
 impl SkwiggleApp {
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("New").clicked() {
-                    self.new_doc();
-                    ui.close();
-                }
-                if ui.button("Open…  ⌘O").clicked() {
-                    ui.close();
-                    self.open();
-                }
-                if ui.button("Save  ⌘S").clicked() {
-                    ui.close();
-                    self.save(false);
-                }
-                if ui.button("Save As…").clicked() {
-                    ui.close();
-                    self.save(true);
-                }
+    /// Glass panels floating over the canvas, which shows through blurred.
+    fn floating_panels(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        canvas: Rect,
+        canvas_layer: egui::LayerId,
+    ) {
+        const MARGIN: f32 = 8.0;
+        let bg = canvas_bg(ctx.global_style().visuals.dark_mode);
+        let mut backdrop = glass::Backdrop::capture(ctx, frame.wgpu_render_state(), canvas_layer, bg);
+        // Without wgpu the shader can't draw the glass, so fall back to a flat tint.
+        let flat = backdrop.is_none();
+        self.glass_live = !flat;
+        let inner = canvas.shrink(MARGIN);
+        for (slot, left) in [(0, true), (1, false)] {
+            let max_w = (inner.width() * 0.45).max(120.0);
+            let w = self.panel_widths[slot].clamp(120.0, max_w);
+            let rect = if left {
+                Rect::from_min_size(inner.min, vec2(w, inner.height()))
+            } else {
+                Rect::from_min_size(pos2(inner.max.x - w, inner.min.y), vec2(w, inner.height()))
+            };
+            let id = egui::Id::new(("glass_panel", slot));
+            egui::Area::new(id)
+                .order(egui::Order::Middle)
+                .fixed_pos(rect.min)
+                .constrain(false)
+                .show(ctx, |ui| {
+                    ui.set_min_size(rect.size());
+                    ui.set_max_size(rect.size());
+                    let painter = ui.painter();
+                    painter.add(
+                        glass::Panel {
+                            slot,
+                            rect,
+                            settings: self.glass,
+                            backdrop: backdrop.take(),
+                        }
+                        .shape(),
+                    );
+                    if flat {
+                        painter.rect(
+                            rect,
+                            self.glass.radius,
+                            Color32::from_black_alpha(90),
+                            Stroke::new(1.0, Color32::from_white_alpha(28)),
+                            StrokeKind::Inside,
+                        );
+                    }
+
+                    // Drag the inner edge to resize.
+                    let edge = if left { rect.max.x } else { rect.min.x };
+                    let handle = Rect::from_x_y_ranges(edge - 4.0..=edge + 4.0, rect.y_range());
+                    let resp = ui.interact(handle, id.with("resize"), Sense::drag());
+                    if resp.hovered() || resp.dragged() {
+                        ui.set_cursor_icon(CursorIcon::ResizeHorizontal);
+                    }
+                    if resp.dragged() {
+                        let dx = resp.drag_delta().x;
+                        self.panel_widths[slot] = w + if left { dx } else { -dx };
+                    }
+
+                    let content = rect.shrink2(vec2(12.0, 10.0));
+                    let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(content));
+                    ui.set_clip_rect(content);
+                    if left {
+                        self.layers_panel(&mut ui);
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(&mut ui, |ui| {
+                                self.coalesce_edits(|app| app.properties_panel(ui))
+                            });
+                    }
+                });
+        }
+        let right = inner.max.x - self.panel_widths[1].clamp(120.0, (inner.width() * 0.45).max(120.0));
+        self.stats(ctx, pos2(right - MARGIN, inner.min.y));
+    }
+
+    /// A small FPS and entity count readout, its top-right corner at `anchor`.
+    fn stats(&self, ctx: &egui::Context, anchor: Pos2) {
+        let glass = self.glass_live.then_some(self.glass);
+        let text = format!("{} fps · {} entities", self.frame_times.len(), self.world.entities.len());
+        egui::Area::new(egui::Id::new("stats"))
+            .order(egui::Order::Middle)
+            .fixed_pos(anchor)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .interactable(false)
+            .show(ctx, |ui| {
+                widgets::glass_bar(ui, glass, widgets::STATS_SLOT, |ui| {
+                    ui.label(egui::RichText::new(text).monospace().small().color(Color32::from_gray(200)));
+                });
             });
-            ui.separator();
+    }
 
-            for t in TOOLS {
-                let label = format!("{} ({:?})", t.label(), t.key());
-                if ui.selectable_label(self.tool == t, label).clicked() {
-                    self.tool = t;
-                }
-            }
-            ui.separator();
-
-            if ui
-                .add_enabled(!self.undo.is_empty(), egui::Button::new("↶ Undo"))
-                .clicked()
-            {
-                self.undo();
-            }
-            if ui
-                .add_enabled(!self.redo.is_empty(), egui::Button::new("↷ Redo"))
-                .clicked()
-            {
-                self.redo();
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(format!("{:.0}%", self.zoom * 100.0))
-                    .on_hover_text("Reset zoom (⌘0)")
-                    .clicked()
-                {
-                    self.zoom = 1.0;
-                }
-                ui.label(egui::RichText::new(&self.status).weak());
+    /// The bottom-centre bar of creation tools.
+    fn tools_bar(&mut self, ctx: &egui::Context, canvas: Rect) {
+        const MARGIN: f32 = 16.0;
+        let glass = self.glass_live.then_some(self.glass);
+        egui::Area::new(egui::Id::new("tools_bar"))
+            .fixed_pos(pos2(canvas.center().x, canvas.max.y - MARGIN))
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .constrain_to(canvas)
+            .show(ctx, |ui| {
+                widgets::glass_bar(ui, glass, widgets::TOOLS_SLOT, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for t in TOOLS {
+                            let hint = format!("{} ({:?})", t.label(), t.key());
+                            if widgets::tool_tile(ui, t.icon(), self.tool == t, &hint).clicked() {
+                                self.tool = t;
+                            }
+                        }
+                    });
+                });
             });
-        });
+    }
+
+    /// Sliders for tuning the floating panels' glass look.
+    fn glass_settings(&mut self, ui: &mut egui::Ui) {
+        let g = &mut self.glass;
+        let slider = |ui: &mut egui::Ui, v: &mut f32, range, text: &str, hint: &str| {
+            ui.add(egui::Slider::new(v, range).text(text).custom_parser(calc::parse))
+                .on_hover_text(hint);
+        };
+        slider(ui, &mut g.tint, 0.0..=1.2, "Tint", "Backdrop brightness; 1 is untinted");
+        slider(ui, &mut g.saturation, 0.0..=2.5, "Saturation", "Backdrop colour boost");
+        slider(ui, &mut g.frost, 0.0..=1.0, "Frost", "Mix of sharp (0) and blurred (1) backdrop");
+        slider(ui, &mut g.blur_spread, 0.0..=8.0, "Blur spread", "Width of each blur pass");
+        ui.add(egui::Slider::new(&mut g.blur_passes, 1..=8).text("Blur passes"))
+            .on_hover_text("More passes give a smoother, wider blur");
+        slider(ui, &mut g.blur_scale, 0.1..=1.0, "Blur resolution", "Lower is cheaper and blurrier");
+        slider(ui, &mut g.bevel, 0.0..=80.0, "Bevel", "Width of the curved edge, in points");
+        slider(ui, &mut g.refraction, 0.0..=2.0, "Refraction", "How far the edge bends the canvas");
+        slider(ui, &mut g.chroma, 0.0..=0.5, "Chromatic", "Colour split along the edge");
+        slider(ui, &mut g.fresnel, 0.0..=4.0, "Edge glow", "Brightening of the curved edge");
+        slider(ui, &mut g.rim, 0.0..=2.0, "Rim light", "Strength of the thin specular edge");
+        slider(ui, &mut g.hairline, 0.0..=0.5, "Hairline", "Faint line just inside the rim");
+        slider(ui, &mut g.light_angle, -180.0..=180.0, "Light angle", "Degrees clockwise from up");
+        slider(ui, &mut g.radius, 0.0..=40.0, "Corner radius", "Panel corner radius, in points");
+        let changed = *g != glass::Settings::default();
+        if reset_button(ui, changed, "Restore default glass settings") {
+            self.glass = glass::Settings::default();
+        }
     }
 
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
@@ -548,12 +741,17 @@ impl SkwiggleApp {
                     .map(|&c| (c, depth + 1)),
             );
         }
+        // Only lay out the rows in view, so huge documents stay fast.
+        let row_h = ui.spacing().interact_size.y;
+        let layout = egui::Layout::left_to_right(egui::Align::Center);
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for (e, depth) in rows {
+            .show_rows(ui, row_h, rows.len(), |ui, range| {
+                for &(e, depth) in &rows[range] {
                     let w = &self.world;
-                    ui.horizontal(|ui| {
+                    let size = vec2(ui.available_width(), row_h);
+                    ui.allocate_ui_with_layout(size, layout, |ui| {
+                        ui.set_min_height(row_h);
                         ui.add_space(depth as f32 * 14.0);
                         let eye = if w.visible(e) { "◉" } else { "○" };
                         if ui
@@ -598,13 +796,8 @@ impl SkwiggleApp {
                 let snap = &mut self.world.snap;
                 ui.horizontal(|ui| {
                     ui.label("Step");
-                    ui.add(
-                        DragValue::new(&mut snap.step)
-                            .range(1.0..=256.0)
-                            .speed(0.1)
-                            .custom_parser(calc::parse),
-                    )
-                    .on_hover_text("Checked properties snap to multiples of this");
+                    ui.add(Scrub::new(&mut snap.step).range(1.0..=256.0).speed(0.1))
+                        .on_hover_text("Checked properties snap to multiples of this");
                 });
                 ui.checkbox(&mut snap.position, "Position (move & nudge)");
                 ui.horizontal(|ui| {
@@ -675,6 +868,9 @@ impl SkwiggleApp {
                     self.world.shimmer = Shimmer::default();
                 }
             });
+        egui::CollapsingHeader::new("Glass")
+            .default_open(false)
+            .show(ui, |ui| self.glass_settings(ui));
         ui.separator();
 
         let snap = self.world.snap.clone();
@@ -684,6 +880,9 @@ impl SkwiggleApp {
             }
             &[id] => {
                 let kind = self.world.kind(id);
+                let rotation = self.world.rotations.get(id).map_or(0.0, |r| r.0);
+                let mut new_rotation = rotation;
+                let shift = ui.input(|i| i.modifiers.shift);
                 let w = &mut self.world;
                 let paints = &mut self.paints;
                 // One row group per component the entity has.
@@ -697,6 +896,7 @@ impl SkwiggleApp {
                             ui.end_row();
                         }
 
+                        let mut anchor = w.anchors.get(id).copied().unwrap_or_default();
                         if let Some(t) = w.transforms.get_mut(id) {
                             ui.label("Position");
                             ui.horizontal(|ui| {
@@ -707,17 +907,21 @@ impl SkwiggleApp {
 
                             ui.label("Size");
                             ui.horizontal(|ui| {
-                                ui.add(
-                                    snapped(&mut t.w, snap.width_step())
-                                        .prefix("W ")
-                                        .range(0.0..=f32::MAX),
-                                );
-                                ui.add(
-                                    snapped(&mut t.h, snap.height_step())
-                                        .prefix("H ")
-                                        .range(0.0..=f32::MAX),
-                                );
+                                let width = anchored_size(t, true, anchor, snap.width_step());
+                                ui.add(width.prefix("W "));
+                                let height = anchored_size(t, false, anchor, snap.height_step());
+                                ui.add(height.prefix("H "));
                             });
+                            ui.end_row();
+
+                            ui.label("Rotation");
+                            ui.add(rotation_input(&mut new_rotation, shift));
+                            ui.end_row();
+
+                            ui.label("Anchor");
+                            if widgets::anchor_grid(ui, &mut anchor, 36.0).changed() {
+                                w.anchors.insert(id, anchor);
+                            }
                             ui.end_row();
                         }
 
@@ -754,12 +958,7 @@ impl SkwiggleApp {
                             ui.horizontal(|ui| {
                                 ui.color_edit_button_srgba_unmultiplied(&mut st.color);
                                 let step = snap.stroke_step();
-                                ui.add(
-                                    snapped(&mut st.width, step)
-                                        .range(0.0..=100.0)
-                                        // Fine control unless snapping in whole steps.
-                                        .speed(if step > 0.0 { 1.0 } else { 0.1 }),
-                                );
+                                ui.add(snapped(&mut st.width, step).range(0.0..=100.0).speed(1.0));
                             });
                             ui.end_row();
                         }
@@ -777,9 +976,13 @@ impl SkwiggleApp {
                             ui.end_row();
                         }
                     });
+                if new_rotation != rotation {
+                    self.world.set_rotation(id, new_rotation);
+                }
             }
             many => {
                 ui.label(format!("{} layers selected", many.len()));
+                self.arrange_controls(ui);
             }
         }
 
@@ -836,26 +1039,55 @@ impl SkwiggleApp {
         })
     }
 
+    /// Screen-space handles of `id`, turned with its rotation.
+    fn rotated_handles(&self, origin: Pos2, id: Entity) -> Vec<(Handle, Pos2)> {
+        let r = self.rect_to_screen(origin, self.world.rect(id));
+        let rot = Rot2::from_angle(self.world.angle(id));
+        Self::handles(r)
+            .map(|(h, p)| (h, r.center() + rot * (p - r.center())))
+            .collect()
+    }
+
+    /// Screen-space outline of `id`, turned with its rotation.
+    fn screen_corners(&self, origin: Pos2, id: Entity) -> Vec<Pos2> {
+        self.world
+            .corners(id)
+            .iter()
+            .map(|p| self.to_screen(origin, *p))
+            .collect()
+    }
+
     /// The resize handle of the (single) selected shape under the screen point.
     fn handle_at(&self, origin: Pos2, screen: Pos2) -> Option<(Entity, Handle)> {
         let [id] = self.selection.as_slice() else {
             return None;
         };
-        let r = self.rect_to_screen(origin, self.world.rect(*id));
-        Self::handles(r)
-            .find(|(_, p)| (*p - screen).abs().max_elem() <= HANDLE_SIZE)
+        self.rotated_handles(origin, *id)
+            .into_iter()
+            .find(|(_, p)| (*p - screen).length() <= HANDLE_SIZE)
             .map(|(h, _)| (*id, h))
+    }
+
+    /// The (single) selected shape, when the screen point is just outside one of its corners.
+    fn rotate_zone_at(&self, origin: Pos2, screen: Pos2) -> Option<Entity> {
+        let &[id] = self.selection.as_slice() else {
+            return None;
+        };
+        if self.editing_text.is_some() {
+            return None;
+        }
+        let r = self.rect_to_screen(origin, self.world.rect(id));
+        let local = r.center() + Rot2::from_angle(-self.world.angle(id)) * (screen - r.center());
+        let near_corner = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()]
+            .iter()
+            .any(|c| (*c - local).length() <= ROTATE_ZONE);
+        (near_corner && !r.contains(local)).then_some(id)
     }
 
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let origin = resp.rect.min;
-        let dark = ui.visuals().dark_mode;
-        let bg = if dark {
-            Color32::from_gray(30)
-        } else {
-            Color32::from_gray(245)
-        };
+        let bg = canvas_bg(ui.visuals().dark_mode);
         painter.rect_filled(resp.rect, 0.0, bg);
 
         // --- Zoom & pan with wheel / trackpad --------------------------------
@@ -872,7 +1104,7 @@ impl SkwiggleApp {
             if zoom_delta != 1.0 {
                 if let Some(p) = hover {
                     let anchor = self.to_world(origin, p);
-                    self.zoom = (self.zoom * zoom_delta).clamp(0.1, 64.0);
+                    self.zoom = (self.zoom * zoom_delta).clamp(0.1, 10.0);
                     self.pan = p - origin - anchor.to_vec2() * self.zoom;
                 }
             } else {
@@ -903,8 +1135,7 @@ impl SkwiggleApp {
                 .unwrap_or(origin);
             let start = self.to_world(origin, press);
             let snapped_start = snap_pos(start, self.world.snap.position_step());
-            let pan =
-                resp.dragged_by(PointerButton::Middle) || space_pan || self.tool == Tool::Hand;
+            let pan = resp.dragged_by(PointerButton::Middle) || space_pan;
             self.drag = if pan {
                 Drag::Pan
             } else if !resp.dragged_by(PointerButton::Primary) {
@@ -920,7 +1151,7 @@ impl SkwiggleApp {
                         self.selection = vec![id];
                         Drag::Create { id, start }
                     }
-                    Tool::Text | Tool::Hand => Drag::None,
+                    Tool::Text => Drag::None,
                 }
             };
         }
@@ -928,7 +1159,8 @@ impl SkwiggleApp {
         if resp.dragged()
             && let Some(wp) = world
         {
-            self.update_drag(wp, resp.drag_delta(), shift);
+            let mods = ui.input(|i| i.modifiers);
+            self.update_drag(wp, resp.drag_delta(), mods);
         }
 
         if resp.drag_stopped() {
@@ -973,12 +1205,17 @@ impl SkwiggleApp {
             let icon = match (&self.drag, self.tool) {
                 (Drag::Pan, _) => CursorIcon::Grabbing,
                 _ if space_pan => CursorIcon::Grab,
-                (_, Tool::Hand) => CursorIcon::Grab,
                 (_, Tool::Rect | Tool::Ellipse | Tool::Frame) => CursorIcon::Crosshair,
                 (_, Tool::Text) => CursorIcon::Text,
-                (Drag::Resize { handle, .. }, _) => resize_cursor(*handle),
+                (Drag::Resize { id, handle, .. }, _) => {
+                    resize_cursor(*handle, self.world.angle(*id))
+                }
+                (Drag::Rotate { .. }, _) => CursorIcon::Crosshair,
                 _ => match pointer.and_then(|p| self.handle_at(origin, p)) {
-                    Some((_, h)) => resize_cursor(h),
+                    Some((id, h)) => resize_cursor(h, self.world.angle(id)),
+                    None if pointer.and_then(|p| self.rotate_zone_at(origin, p)).is_some() => {
+                        CursorIcon::Crosshair
+                    }
                     None => CursorIcon::Default,
                 },
             };
@@ -1011,34 +1248,69 @@ impl SkwiggleApp {
         let roots = self.world.topmost(&self.selection);
         let bounds = roots
             .iter()
-            .fold(Rect::NOTHING, |b, &e| b.union(self.world.rect(e)));
+            .fold(Rect::NOTHING, |b, &e| b.union(self.world.bounds(e)));
         let exclude = self.world.with_descendants(&roots);
         align(&self.world, bounds, &exclude, ALL_EDGES, 0.0)
     }
 
     /// A floating WYSIWYG editor above the selected entity, with a control per visual component.
+    /// Where the floating toolbar sits for the current selection, if it's on screen.
+    fn toolbar_placement(
+        &mut self,
+        ui: &egui::Ui,
+        origin: Pos2,
+        canvas: Rect,
+    ) -> Option<(Pos2, egui::Align2)> {
+        if self.selection.is_empty() || !matches!(self.drag, Drag::None) {
+            return None;
+        }
+        let bounds = self
+            .selection
+            .iter()
+            .fold(Rect::NOTHING, |b, &e| b.union(self.world.bounds(e)));
+        let r = self.rect_to_screen(origin, bounds);
+        let held = ui.input(|i| i.pointer.any_down());
+        Some(match &self.toolbar_pin {
+            // Stay put mid-edit so scrubbing a value can't fling the toolbar away.
+            Some((pinned, anchor, pivot)) if held && *pinned == self.selection => (*anchor, *pivot),
+            _ => {
+                if !r.intersects(canvas) {
+                    self.toolbar_pin = None;
+                    return None;
+                }
+                // Sit above the entity, or below it when there's no room at the top.
+                let placement = if r.min.y - TOOLBAR_GAP - 40.0 > canvas.min.y {
+                    (
+                        pos2(r.center().x, r.min.y - TOOLBAR_GAP),
+                        egui::Align2::CENTER_BOTTOM,
+                    )
+                } else {
+                    (
+                        pos2(r.center().x, r.max.y + TOOLBAR_GAP),
+                        egui::Align2::CENTER_TOP,
+                    )
+                };
+                self.toolbar_pin = Some((self.selection.clone(), placement.0, placement.1));
+                placement
+            }
+        })
+    }
+
+    /// The floating toolbar: per-component controls for one entity, arrange controls for several.
     fn entity_toolbar(&mut self, ui: &egui::Ui, origin: Pos2, canvas: Rect) {
-        let &[id] = self.selection.as_slice() else {
+        let Some((anchor, pivot)) = self.toolbar_placement(ui, origin, canvas) else {
             return;
         };
-        let r = self.rect_to_screen(origin, self.world.rect(id));
-        if !matches!(self.drag, Drag::None) || !r.intersects(canvas) {
+        let &[id] = self.selection.as_slice() else {
+            self.selection_toolbar(ui, anchor, pivot, canvas);
             return;
-        }
-        // Sit above the entity, or below it when there's no room at the top.
-        let (anchor, pivot) = if r.min.y - TOOLBAR_GAP - 40.0 > canvas.min.y {
-            (
-                pos2(r.center().x, r.min.y - TOOLBAR_GAP),
-                egui::Align2::CENTER_BOTTOM,
-            )
-        } else {
-            (
-                pos2(r.center().x, r.max.y + TOOLBAR_GAP),
-                egui::Align2::CENTER_TOP,
-            )
         };
         let kind = self.world.kind(id);
+        let glass = self.glass_live.then_some(self.glass);
         let snap = self.world.snap.clone();
+        let rotation = self.world.rotations.get(id).map_or(0.0, |r| r.0);
+        let mut new_rotation = rotation;
+        let shift = ui.input(|i| i.modifiers.shift);
         let w = &mut self.world;
         let paints = &mut self.paints;
         egui::Area::new(egui::Id::new("entity_toolbar"))
@@ -1046,25 +1318,23 @@ impl SkwiggleApp {
             .pivot(pivot)
             .constrain_to(canvas)
             .show(ui.ctx(), |ui| {
-                widgets::bar().show(ui, |ui| {
+                widgets::glass_bar(ui, glass, widgets::ENTITY_SLOT, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
+                        let mut anchor = w.anchors.get(id).copied().unwrap_or_default();
                         if let Some(t) = w.transforms.get_mut(id) {
                             let ps = snap.position_step();
-                            let size = |v, step| snapped(v, step).range(0.0..=f32::MAX);
                             number_tile(ui, Glyph::X, snapped(&mut t.x, ps), "X");
                             number_tile(ui, Glyph::Y, snapped(&mut t.y, ps), "Y");
-                            number_tile(
-                                ui,
-                                Glyph::Width,
-                                size(&mut t.w, snap.width_step()),
-                                "Width",
-                            );
+                            let width = anchored_size(t, true, anchor, snap.width_step());
+                            number_tile(ui, Glyph::Width, width, "Width");
                             // Text height follows its content.
                             if kind != ShapeKind::Text {
-                                let h = size(&mut t.h, snap.height_step());
+                                let h = anchored_size(t, false, anchor, snap.height_step());
                                 number_tile(ui, Glyph::Height, h, "Height");
                             }
+                            let r = rotation_input(&mut new_rotation, shift);
+                            number_tile(ui, Glyph::Rotation, r, "Rotation (⇧ snaps to 15°)");
                         }
                         if let Some(c) = w.radii.get_mut(id) {
                             let v = snapped(&mut c.0, snap.radius_step()).range(0.0..=1000.0);
@@ -1073,9 +1343,7 @@ impl SkwiggleApp {
                         if let Some(st) = w.strokes.get_mut(id) {
                             let step = snap.stroke_step();
                             let glyph = Glyph::Border(st.width);
-                            let v = snapped(&mut st.width, step)
-                                .range(0.0..=100.0)
-                                .speed(if step > 0.0 { 1.0 } else { 0.1 });
+                            let v = snapped(&mut st.width, step).range(0.0..=100.0).speed(1.0);
                             number_tile(ui, glyph, v, "Border width");
                         }
                         if let Some(t) = w.texts.get_mut(id) {
@@ -1096,12 +1364,80 @@ impl SkwiggleApp {
                         if let Some(f) = w.frames.get_mut(id) {
                             widgets::clip_tile(ui, &mut f.clip);
                         }
+                        if w.transforms.has(id)
+                            && widgets::anchor_grid(ui, &mut anchor, widgets::TILE).changed()
+                        {
+                            w.anchors.insert(id, anchor);
+                        }
                     });
                 });
             });
+        if new_rotation != rotation {
+            self.world.set_rotation(id, new_rotation);
+        }
+    }
+
+    /// Arrange controls in the properties panel for a multi-selection.
+    fn arrange_controls(&mut self, ui: &mut egui::Ui) {
+        let roots = self.world.topmost(&self.selection);
+        ui.label("Align");
+        let mut action = ui.horizontal(|ui| align_buttons(ui, roots.len())).inner;
+        action = action.or(ui.horizontal(|ui| space_buttons(ui, roots.len())).inner);
+        if let Some(icon) = action {
+            self.arrange(icon);
+        }
+    }
+
+    /// The floating toolbar for several selected entities.
+    fn selection_toolbar(&mut self, ui: &egui::Ui, anchor: Pos2, pivot: egui::Align2, canvas: Rect) {
+        let n = self.world.topmost(&self.selection).len();
+        let glass = self.glass_live.then_some(self.glass);
+        let action = egui::Area::new(egui::Id::new("selection_toolbar"))
+            .fixed_pos(anchor)
+            .pivot(pivot)
+            .constrain_to(canvas)
+            .show(ui.ctx(), |ui| {
+                widgets::glass_bar(ui, glass, widgets::ENTITY_SLOT, |ui| {
+                    ui.horizontal(|ui| {
+                        let a = align_buttons(ui, n);
+                        ui.separator();
+                        a.or(space_buttons(ui, n))
+                    })
+                    .inner
+                })
+            })
+            .inner;
+        if let Some(icon) = action {
+            self.arrange(icon);
+        }
+    }
+
+    /// Aligns or spaces out the selection's top-level entities.
+    fn arrange(&mut self, icon: widgets::ArrangeIcon) {
+        let roots = self.world.topmost(&self.selection);
+        self.checkpoint();
+        match icon {
+            widgets::ArrangeIcon::Align(horizontal, at) => self.world.align(&roots, horizontal, at),
+            widgets::ArrangeIcon::Distribute(horizontal) => {
+                self.world.distribute(&roots, horizontal)
+            }
+        }
     }
 
     fn begin_select_drag(&mut self, origin: Pos2, press: Pos2, start: Pos2, shift: bool) -> Drag {
+        if self.handle_at(origin, press).is_none()
+            && let Some(id) = self.rotate_zone_at(origin, press)
+        {
+            self.checkpoint();
+            let center = self.world.rect(id).center();
+            let d = start - center;
+            return Drag::Rotate {
+                id,
+                center,
+                start: d.y.atan2(d.x),
+                original: self.world.rotations.get(id).map_or(0.0, |r| r.0),
+            };
+        }
         if let Some((id, handle)) = self.handle_at(origin, press) {
             self.checkpoint();
             let original = self.world.rect(id);
@@ -1150,7 +1486,8 @@ impl SkwiggleApp {
         )
     }
 
-    fn update_drag(&mut self, wp: Pos2, screen_delta: Vec2, shift: bool) {
+    fn update_drag(&mut self, wp: Pos2, screen_delta: Vec2, mods: Modifiers) {
+        let shift = mods.shift;
         let ps = self.world.snap.position_step();
         let (ws, hs) = (self.world.snap.width_step(), self.world.snap.height_step());
         match &self.drag {
@@ -1162,7 +1499,9 @@ impl SkwiggleApp {
                 let bounds = originals
                     .iter()
                     .filter(|(id, _)| roots.contains(id))
-                    .fold(Rect::NOTHING, |b, (_, r)| b.union(*r));
+                    .fold(Rect::NOTHING, |b, (id, r)| {
+                        b.union(self.world.bounds_of(*id, *r))
+                    });
                 let d = snap_pos(bounds.min + (wp - *start), ps) - bounds.min;
                 // Alignment with other shapes wins over the grid when close enough.
                 let moved: Vec<Entity> = originals.iter().map(|(id, _)| *id).collect();
@@ -1185,29 +1524,72 @@ impl SkwiggleApp {
                 start,
                 original,
             } => {
-                // The dragged edge moves so the size snaps; the opposite edge stays put.
-                let d = wp - *start;
-                let (mut min, mut max) = (original.min, original.max);
-                match handle.0 {
-                    -1 => min.x = max.x - snap(original.width() - d.x, ws),
-                    1 => max.x = min.x + snap(original.width() + d.x, ws),
-                    _ => {}
+                // Like Figma: ⇧ keeps proportions, ⌥ resizes from the centre, ⌘ skips snapping.
+                let (alt, free) = (mods.alt, mods.command);
+                let angle = self.world.angle(*id);
+                let rot = Rot2::from_angle(angle);
+                let d = rot.inverse() * (wp - *start);
+                let (hx, hy) = (handle.0 as f32, handle.1 as f32);
+                let grow = if alt { 2.0 } else { 1.0 };
+                let step = |s: f32| if free { 0.0 } else { s };
+                // Signed sizes, negative once dragged past the fixed side.
+                let mut size = vec2(
+                    snap(original.width() + hx * d.x * grow, step(ws)),
+                    snap(original.height() + hy * d.y * grow, step(hs)),
+                );
+                if shift {
+                    let o = original.size().max(Vec2::splat(1e-3));
+                    let (sx, sy) = (size.x / o.x, size.y / o.y);
+                    let m = match handle {
+                        (0, _) => sy.abs(),
+                        (_, 0) => sx.abs(),
+                        _ => sx.abs().max(sy.abs()),
+                    };
+                    let sign = |s: f32, h: i8| if h == 0 { 1.0 } else { s.signum() };
+                    size = vec2(o.x * m * sign(sx, handle.0), o.y * m * sign(sy, handle.1));
                 }
-                match handle.1 {
-                    -1 => min.y = max.y - snap(original.height() - d.y, hs),
-                    1 => max.y = min.y + snap(original.height() + d.y, hs),
-                    _ => {}
+                // The point that stays put, as a fraction of the rect: opposite side, or centre with ⌥.
+                let f = if alt {
+                    Vec2::splat(0.5)
+                } else {
+                    vec2(1.0 - hx, 1.0 - hy) / 2.0
+                };
+                let fixed = original.min + original.size() * f;
+                let min = fixed - size * f;
+                let r = Rect::from_two_pos(min, min + size);
+                // Turned shapes spin about their own centre, so shift back to keep the fixed point still.
+                let c = original.center() - r.center();
+                let r = r.translate(c - rot * c);
+                if angle != 0.0 || free {
+                    self.world.set_rect(*id, r);
+                    self.alignment = Alignment::default();
+                    return;
                 }
-                // Only the dragged edges snap to other shapes.
-                let r = Rect::from_two_pos(min, max);
-                let mask = [
-                    dragged_edge(handle.0, min.x <= max.x),
-                    dragged_edge(handle.1, min.y <= max.y),
-                ];
+                // Only the dragged edges snap to other shapes, and not when proportions are held.
+                let edge = |h: i8, upright: bool| match (h, alt) {
+                    (0, _) => [false; 3],
+                    (_, true) => [true, false, true],
+                    _ => dragged_edge(h, upright),
+                };
+                let mask = [edge(handle.0, size.x >= 0.0), edge(handle.1, size.y >= 0.0)];
+                let reach = if shift || alt { 0.0 } else { GUIDE_SNAP / self.zoom };
                 let exclude = self.world.with_descendants(&[*id]);
-                let a = align(&self.world, r, &exclude, mask, GUIDE_SNAP / self.zoom);
+                let a = align(&self.world, r, &exclude, mask, reach);
                 self.world.set_rect(*id, a.rect);
                 self.alignment = a;
+            }
+            &Drag::Rotate {
+                id,
+                center,
+                start,
+                original,
+            } => {
+                let d = wp - center;
+                let mut deg = original + (d.y.atan2(d.x) - start).to_degrees();
+                if shift {
+                    deg = (deg / ROTATE_SNAP).round() * ROTATE_SNAP;
+                }
+                self.world.set_rotation(id, deg);
             }
             Drag::Create { id, start } => {
                 let size = wp - *start;
@@ -1240,7 +1622,7 @@ impl SkwiggleApp {
                 let w = &self.world;
                 for &e in &w.entities {
                     let root = w.parent(e).is_none();
-                    if root && w.visible(e) && m.intersects(w.rect(e)) && !sel.contains(&e) {
+                    if root && w.visible(e) && m.intersects(w.bounds(e)) && !sel.contains(&e) {
                         sel.push(e);
                     }
                 }
@@ -1278,7 +1660,6 @@ impl SkwiggleApp {
                 self.editing_text = Some(id);
                 self.focus_text = true;
             }
-            Tool::Hand => {}
         }
     }
 
@@ -1328,7 +1709,7 @@ impl SkwiggleApp {
         if !w.frames.has(e) || !w.visible(e) || w.parent(e).is_some() {
             return None;
         }
-        let r = self.rect_to_screen(origin, w.rect(e));
+        let r = self.rect_to_screen(origin, w.bounds(e));
         Some(Rect::from_min_max(
             pos2(r.min.x, r.min.y - 18.0),
             pos2(r.max.x, r.min.y - 2.0),
@@ -1451,7 +1832,7 @@ impl SkwiggleApp {
             let sel = self
                 .selection
                 .iter()
-                .map(|id| self.rect_to_screen(origin, self.world.rect(*id)));
+                .map(|id| self.rect_to_screen(origin, self.world.bounds(*id)));
             sel.chain(hover.map(Rect::from_pos)).collect()
         } else {
             Vec::new()
@@ -1572,7 +1953,7 @@ impl SkwiggleApp {
             let t = ctx.input(|i| i.time) as f32;
             let pulse = 0.5 + 0.5 * (t * std::f32::consts::TAU * 1.5).sin();
             for id in &al.aligned {
-                let r = self.rect_to_screen(origin, self.world.rect(*id));
+                let r = self.rect_to_screen(origin, self.world.bounds(*id));
                 painter.rect_filled(r, 0.0, GUIDE.gamma_multiply(0.08 + 0.12 * pulse));
                 let stroke =
                     Stroke::new(1.0 + 2.0 * pulse, GUIDE.gamma_multiply(0.4 + 0.6 * pulse));
@@ -1662,35 +2043,43 @@ impl SkwiggleApp {
             && let Some(id) = hover_world.and_then(|p| self.pick(origin, self.to_screen(origin, p)))
             && !self.selection.contains(&id)
         {
-            let r = self.rect_to_screen(origin, self.world.rect(id));
-            painter.rect_stroke(r, 0.0, outline, StrokeKind::Outside);
+            painter.add(egui::Shape::closed_line(self.screen_corners(origin, id), outline));
         }
 
         // Selection outlines.
         let mut bounds = Rect::NOTHING;
         for id in &self.selection {
-            let r = self.rect_to_screen(origin, self.world.rect(*id));
-            painter.rect_stroke(r, 0.0, outline, StrokeKind::Outside);
-            bounds = bounds.union(r);
+            let corners = self.screen_corners(origin, *id);
+            bounds = bounds.union(Rect::from_points(&corners));
+            painter.add(egui::Shape::closed_line(corners, outline));
         }
 
         // Resize handles for a single selection.
         if let [id] = self.selection.as_slice()
             && self.editing_text.is_none()
         {
-            let r = self.rect_to_screen(origin, self.world.rect(*id));
-            for (_, p) in Self::handles(r) {
+            let rot = Rot2::from_angle(self.world.angle(*id));
+            for (_, p) in self.rotated_handles(origin, *id) {
                 let h = Rect::from_center_size(p, Vec2::splat(HANDLE_SIZE));
-                painter.rect_filled(h, 1.0, Color32::WHITE);
-                painter.rect_stroke(h, 1.0, outline, StrokeKind::Inside);
+                let quad = [h.left_top(), h.right_top(), h.right_bottom(), h.left_bottom()]
+                    .map(|c| p + rot * (c - p));
+                painter.add(egui::Shape::convex_polygon(quad.to_vec(), Color32::WHITE, outline));
             }
         }
 
-        // Size badge under the selection.
+        // Size badge under the selection, or the angle while rotating.
         if bounds != Rect::NOTHING {
             {
-                let size = bounds.size() / self.zoom;
-                let text = format!("{:.0} × {:.0}", size.x, size.y);
+                let size = match self.selection.as_slice() {
+                    [id] => self.world.rect(*id).size(),
+                    _ => bounds.size() / self.zoom,
+                };
+                let text = match self.drag {
+                    Drag::Rotate { id, .. } => {
+                        format!("{:.0}°", self.world.rotations.get(id).map_or(0.0, |r| r.0))
+                    }
+                    _ => format!("{:.0} × {:.0}", size.x, size.y),
+                };
                 let galley =
                     painter.layout_no_wrap(text, FontId::proportional(11.0), Color32::WHITE);
                 let pad = vec2(5.0, 2.0);
@@ -1763,7 +2152,7 @@ fn align(world: &World, moving: Rect, exclude: &[Entity], mask: EdgeMask, snap: 
         .into_iter()
         .map(|(e, _)| e)
         .filter(|e| !exclude.contains(e))
-        .map(|e| (e, world.rect(e)))
+        .map(|e| (e, world.bounds(e)))
         .collect();
     let moving_edges = |r: Rect, axis: usize| {
         let e = edges(r, axis == 0);
@@ -1879,15 +2268,74 @@ fn align(world: &World, moving: Rect, exclude: &[Entity], mask: EdgeMask, snap: 
     out
 }
 
-/// A DragValue whose value always lands on a multiple of `step` (0 = no snapping).
-fn snapped(value: &mut f32, step: f32) -> DragValue<'_> {
-    DragValue::from_get_set(move |new| {
-        if let Some(v) = new {
-            *value = snap(v as f32, step);
+/// The six align buttons, enabled for 2+ layers; returns the one clicked.
+fn align_buttons(ui: &mut egui::Ui, layers: usize) -> Option<widgets::ArrangeIcon> {
+    use widgets::ArrangeIcon::Align;
+    ui.spacing_mut().item_spacing.x = 2.0;
+    let enabled = layers >= 2;
+    let mut clicked = None;
+    for (icon, hint) in [
+        (Align(true, 0.0), "Align left"),
+        (Align(true, 0.5), "Align horizontal centres"),
+        (Align(true, 1.0), "Align right"),
+        (Align(false, 0.0), "Align top"),
+        (Align(false, 0.5), "Align vertical centres"),
+        (Align(false, 1.0), "Align bottom"),
+    ] {
+        if widgets::arrange_button(ui, icon, enabled, hint).clicked() && enabled {
+            clicked = Some(icon);
         }
-        *value as f64
+    }
+    clicked
+}
+
+/// The two even-spacing buttons, enabled for 3+ layers; returns the one clicked.
+fn space_buttons(ui: &mut egui::Ui, layers: usize) -> Option<widgets::ArrangeIcon> {
+    use widgets::ArrangeIcon::Distribute;
+    ui.spacing_mut().item_spacing.x = 2.0;
+    let enabled = layers >= 3;
+    let mut clicked = None;
+    for (icon, hint) in [
+        (Distribute(true), "Space evenly horizontally"),
+        (Distribute(false), "Space evenly vertically"),
+    ] {
+        let hint = if enabled { hint } else { "Select 3 or more layers to space evenly" };
+        if widgets::arrange_button(ui, icon, enabled, hint).clicked() && enabled {
+            clicked = Some(icon);
+        }
+    }
+    clicked
+}
+
+/// A number input whose value always lands on a multiple of `step` (0 = no snapping).
+fn snapped(value: &mut f32, step: f32) -> Scrub<'_> {
+    Scrub::new(value).snap(step)
+}
+
+/// A degrees input that snaps to 15° steps while shift is held.
+fn rotation_input(degrees: &mut f32, shift: bool) -> Scrub<'_> {
+    let step = if shift { ROTATE_SNAP } else { 0.0 };
+    Scrub::new(degrees).snap(step).suffix("°").speed(0.5)
+}
+
+/// A width (or height) input that grows and shrinks around `anchor`.
+fn anchored_size(t: &mut Transform, horizontal: bool, anchor: Anchor, step: f32) -> Scrub<'_> {
+    let (fx, fy) = anchor.factor();
+    let f = if horizontal { fx } else { fy };
+    Scrub::from_get_set(move |v| {
+        let (pos, len) = if horizontal {
+            (&mut t.x, &mut t.w)
+        } else {
+            (&mut t.y, &mut t.h)
+        };
+        if let Some(v) = v {
+            *pos += (*len - v as f32) * f;
+            *len = v as f32;
+        }
+        *len as f64
     })
-    .custom_parser(calc::parse)
+    .snap(step)
+    .range(0.0..=f32::MAX)
 }
 
 /// The whole background fades out from 70% zoom, gone by 30%, as it gets too crowded.
@@ -1910,11 +2358,15 @@ fn toggle(selection: &mut Vec<Entity>, id: Entity) {
     }
 }
 
-fn resize_cursor(handle: Handle) -> CursorIcon {
-    match handle {
-        (0, _) => CursorIcon::ResizeVertical,
-        (_, 0) => CursorIcon::ResizeHorizontal,
-        (-1, -1) | (1, 1) => CursorIcon::ResizeNwSe,
+/// The resize cursor closest to the handle's direction once turned by `angle`.
+fn resize_cursor(handle: Handle, angle: f32) -> CursorIcon {
+    let dir = Rot2::from_angle(angle) * vec2(handle.0 as f32, handle.1 as f32);
+    // Eighth-turns from pointing right, folded to a half-turn since cursors are two-way.
+    let octant = ((dir.y.atan2(dir.x) / std::f32::consts::FRAC_PI_4).round() as i32).rem_euclid(4);
+    match octant {
+        0 => CursorIcon::ResizeHorizontal,
+        1 => CursorIcon::ResizeNwSe,
+        2 => CursorIcon::ResizeVertical,
         _ => CursorIcon::ResizeNeSw,
     }
 }
@@ -1977,4 +2429,20 @@ mod tests {
         let a = align(&doc, near, &[], mask, GUIDE_SNAP);
         assert_eq!(a.rect, Rect::from_min_max(min, pos2(200.0, 60.0)));
     }
+}
+
+fn canvas_bg(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_gray(30)
+    } else {
+        Color32::from_gray(245)
+    }
+}
+
+fn error_dialog(title: &str, detail: &str) {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title(title)
+        .set_description(detail)
+        .show();
 }

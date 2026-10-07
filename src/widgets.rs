@@ -1,15 +1,16 @@
 //! Tile widgets for the floating entity toolbar.
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, DragValue, FontId, Layout, Painter, Popup,
-    PopupCloseBehavior, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextStyle, Ui, UiBuilder,
-    Vec2, pos2, vec2,
+    self, Align2, Color32, CornerRadius, FontId, Layout, Painter, Popup, PopupCloseBehavior, Pos2,
+    Rect, Response, Sense, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use egui::widgets::color_picker::{self, Alpha};
 
-use crate::components::color;
+use crate::components::{Anchor, color};
+use crate::glass;
 use crate::paint::{Paint, PaintCache};
 use crate::paint_editor;
+use crate::scrub::Scrub;
 
 pub const TILE: f32 = 44.0;
 const TILE_RADIUS: f32 = 10.0;
@@ -32,6 +33,53 @@ pub fn bar() -> egui::Frame {
         })
 }
 
+/// Glass uniform slots for the floating bars; 0 and 1 are the side panels.
+pub const ENTITY_SLOT: usize = 2;
+pub const TOOLS_SLOT: usize = 3;
+pub const STATS_SLOT: usize = 4;
+
+/// The toolbar pill over liquid glass, or the flat `bar` when glass can't render.
+pub fn glass_bar<R>(
+    ui: &mut Ui,
+    glass: Option<glass::Settings>,
+    slot: usize,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let Some(mut settings) = glass else {
+        return bar().show(ui, add_contents).inner;
+    };
+    let radius = TILE_RADIUS + 10.0;
+    let background = ui.painter().add(egui::Shape::Noop);
+    let inner = egui::Frame::new()
+        .corner_radius(radius)
+        .inner_margin(10.0)
+        .show(ui, add_contents);
+    let rect = inner.response.rect;
+    // Same look as the side panels; only the shape differs, as the bevel must fit the short pill.
+    settings.radius = radius;
+    settings.bevel = settings.bevel.min(rect.height() / 2.0);
+    let shadow = egui::Shadow {
+        offset: [0, 4],
+        blur: 16,
+        spread: 0,
+        color: Color32::from_black_alpha(90),
+    };
+    let panel = glass::Panel {
+        slot,
+        rect,
+        settings,
+        backdrop: None,
+    };
+    ui.painter().set(
+        background,
+        egui::Shape::Vec(vec![
+            shadow.as_shape(rect, CornerRadius::from(radius)).into(),
+            panel.shape(),
+        ]),
+    );
+    inner.inner
+}
+
 /// What a tile edits, shown by which parts of its outline light up.
 #[derive(Clone, Copy)]
 pub enum Glyph {
@@ -43,6 +91,7 @@ pub enum Glyph {
     /// Lit all round, drawn at (roughly) the border's width.
     Border(f32),
     FontSize,
+    Rotation,
 }
 
 impl Glyph {
@@ -56,12 +105,13 @@ impl Glyph {
             Glyph::Radius => ([false; 4], true, None),
             Glyph::Border(_) => ([true; 4], true, None),
             Glyph::FontSize => ([false; 4], false, Some("T")),
+            Glyph::Rotation => ([false; 4], false, Some("°")),
         }
     }
 }
 
 /// A square number tile: drag sideways to adjust, click to type.
-pub fn number_tile(ui: &mut Ui, glyph: Glyph, value: DragValue<'_>, hint: &str) -> Response {
+pub fn number_tile(ui: &mut Ui, glyph: Glyph, value: Scrub<'_>, hint: &str) -> Response {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(TILE), Sense::hover());
     let mut child = ui.new_child(
         UiBuilder::new()
@@ -69,7 +119,7 @@ pub fn number_tile(ui: &mut Ui, glyph: Glyph, value: DragValue<'_>, hint: &str) 
             .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
     );
     tile_style(child.style_mut());
-    let resp = child.add(value.custom_parser(crate::calc::parse));
+    let resp = child.add(value);
     let active = resp.hovered() || resp.dragged() || resp.has_focus();
     outline(ui.painter(), rect, glyph, active);
     resp.on_hover_text(hint)
@@ -218,6 +268,35 @@ pub fn clip_tile(ui: &mut Ui, clip: &mut bool) -> Response {
     resp.on_hover_text(format!("Clip content: {state}"))
 }
 
+/// A 3×3 grid of dots picking which point stays put when the size changes.
+pub fn anchor_grid(ui: &mut Ui, anchor: &mut Anchor, size: f32) -> Response {
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let gap = size * 0.08;
+    let cell = (size - gap * 2.0) / 3.0;
+    let hover = resp.hover_pos();
+    for row in 0..3u8 {
+        for col in 0..3u8 {
+            let min = rect.min + vec2(col as f32, row as f32) * (cell + gap);
+            let r = Rect::from_min_size(min, Vec2::splat(cell));
+            let on = anchor.col == col && anchor.row == row;
+            let hot = hover.is_some_and(|p| r.expand(gap / 2.0).contains(p));
+            if resp.clicked() && hot {
+                *anchor = Anchor { col, row };
+                resp.mark_changed();
+            }
+            let radius = cell * 0.3;
+            let p = ui.painter();
+            if on {
+                p.rect_filled(r, radius, BRIGHT);
+            } else {
+                let c = if hot { MID } else { DIM };
+                p.rect_stroke(r, radius, Stroke::new(1.5, c), StrokeKind::Inside);
+            }
+        }
+    }
+    resp.on_hover_text("Anchor point")
+}
+
 /// A color picker that opens from `resp` and edits `color` in place.
 fn color_popup(resp: &Response, value: &mut [u8; 4]) {
     let mut c = color(*value);
@@ -231,4 +310,104 @@ fn color_popup(resp: &Response, value: &mut [u8; 4]) {
     if changed {
         *value = c.to_srgba_unmultiplied();
     }
+}
+
+/// What an arrange button does, drawn as its icon.
+#[derive(Clone, Copy)]
+pub enum ArrangeIcon {
+    /// Align along x (`true`) or y at 0 start, 0.5 centre, 1 end.
+    Align(bool, f32),
+    /// Even spacing along x (`true`) or y.
+    Distribute(bool),
+}
+
+/// A small icon button for aligning or distributing the selection.
+pub fn arrange_button(ui: &mut Ui, icon: ArrangeIcon, enabled: bool, hint: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+    let resp = if enabled { resp } else { resp.on_disabled_hover_text(hint) };
+    let p = ui.painter();
+    let ink = match (enabled, resp.hovered()) {
+        (false, _) => DIM,
+        (true, true) => BRIGHT,
+        (true, false) => MID,
+    };
+    if enabled && resp.hovered() {
+        p.rect_filled(rect, 6.0, Color32::from_white_alpha(10));
+    }
+    let r = rect.shrink(7.0);
+    // Icons are drawn for the x axis; y swaps the coordinates.
+    let (ArrangeIcon::Align(horizontal, _) | ArrangeIcon::Distribute(horizontal)) = icon;
+    let map = |u: f32, v: f32| {
+        let (x, y) = if horizontal { (u, v) } else { (v, u) };
+        pos2(r.min.x + x * r.width(), r.min.y + y * r.height())
+    };
+    let bar = |u0: f32, u1: f32, v0: f32, v1: f32| {
+        p.rect_filled(Rect::from_two_pos(map(u0, v0), map(u1, v1)), 1.0, ink);
+    };
+    match icon {
+        ArrangeIcon::Align(_, at) => {
+            p.line_segment([map(at, -0.15), map(at, 1.15)], Stroke::new(1.5, ink));
+            for (len, v) in [(0.9, 0.1), (0.55, 0.6)] {
+                let u0 = at * (1.0 - len);
+                bar(u0, u0 + len, v, v + 0.3);
+            }
+        }
+        ArrangeIcon::Distribute(_) => {
+            for u in [0.0, 0.42, 0.84] {
+                bar(u, u + 0.16, 0.1, 0.9);
+            }
+        }
+    }
+    resp.on_hover_text(hint)
+}
+
+/// Icons for the bottom tools bar.
+#[derive(Clone, Copy)]
+pub enum ToolIcon {
+    Move,
+    Frame,
+    Rect,
+    Ellipse,
+    Text,
+}
+
+/// A tile picking a drawing tool, lit while `selected`.
+pub fn tool_tile(ui: &mut Ui, icon: ToolIcon, selected: bool, hint: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(TILE), Sense::click());
+    let p = ui.painter();
+    let hovered = resp.hovered();
+    if selected {
+        p.rect_filled(rect, TILE_RADIUS, Color32::from_white_alpha(28));
+    } else if hovered {
+        p.rect_filled(rect, TILE_RADIUS, Color32::from_white_alpha(8));
+    }
+    let ink = if selected || hovered { BRIGHT } else { MID };
+    let stroke = Stroke::new(1.5, ink);
+    let r = Rect::from_center_size(rect.center(), Vec2::splat(18.0));
+    match icon {
+        ToolIcon::Move => {
+            let pts = [(0.15, 0.0), (0.15, 0.85), (0.38, 0.64), (0.55, 1.0), (0.68, 0.94), (0.52, 0.58), (0.85, 0.58)];
+            let pts = pts.map(|(x, y)| pos2(r.min.x + x * r.width(), r.min.y + y * r.height()));
+            p.add(egui::Shape::closed_line(pts.to_vec(), stroke));
+        }
+        ToolIcon::Frame => {
+            let (a, b) = (0.3, 0.7);
+            for t in [a, b] {
+                let x = r.min.x + t * r.width();
+                let y = r.min.y + t * r.height();
+                p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], stroke);
+                p.line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], stroke);
+            }
+        }
+        ToolIcon::Rect => {
+            p.rect_stroke(r.shrink(1.0), 2.0, stroke, StrokeKind::Middle);
+        }
+        ToolIcon::Ellipse => {
+            p.circle_stroke(r.center(), r.width() / 2.0 - 1.0, stroke);
+        }
+        ToolIcon::Text => {
+            p.text(r.center(), Align2::CENTER_CENTER, "T", FontId::proportional(20.0), ink);
+        }
+    }
+    resp.on_hover_text(hint)
 }

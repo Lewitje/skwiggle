@@ -1,6 +1,6 @@
 //! The document as an ECS world: shapes are entities assembled from components.
 
-use eframe::egui::{Rect, pos2, vec2};
+use eframe::egui::{Pos2, Rect, emath::Rot2, pos2, vec2};
 use serde::Deserialize;
 
 use crate::components::*;
@@ -12,6 +12,8 @@ world! {
     components {
         names: Name,
         transforms: Transform,
+        anchors: Anchor,
+        rotations: Rotation,
         fills: Fill,
         strokes: Stroke,
         radii: CornerRadius,
@@ -119,6 +121,63 @@ impl World {
         }
     }
 
+    /// Clockwise rotation in radians.
+    pub fn angle(&self, e: Entity) -> f32 {
+        self.rotations.get(e).map_or(0.0, |r| r.0.to_radians())
+    }
+
+    /// Corners of `rect` turned by `e`'s rotation, clockwise from top-left.
+    pub fn corners_of(&self, e: Entity, rect: Rect) -> [Pos2; 4] {
+        let rot = Rot2::from_angle(self.angle(e));
+        let c = rect.center();
+        [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()]
+            .map(|p| c + rot * (p - c))
+    }
+
+    pub fn corners(&self, e: Entity) -> [Pos2; 4] {
+        self.corners_of(e, self.rect(e))
+    }
+
+    /// Axis-aligned bounds of `rect` once turned by `e`'s rotation.
+    pub fn bounds_of(&self, e: Entity, rect: Rect) -> Rect {
+        if self.angle(e) == 0.0 || rect == Rect::NOTHING {
+            return rect;
+        }
+        Rect::from_points(&self.corners_of(e, rect))
+    }
+
+    /// Axis-aligned bounds of the rotated shape.
+    pub fn bounds(&self, e: Entity) -> Rect {
+        self.bounds_of(e, self.rect(e))
+    }
+
+    /// Sets `e`'s rotation in degrees; its descendants turn with it about its centre.
+    pub fn set_rotation(&mut self, e: Entity, degrees: f32) {
+        let current = self.rotations.get(e).map_or(0.0, |r| r.0);
+        let delta = normalize_degrees(degrees - current);
+        if delta == 0.0 {
+            return;
+        }
+        let pivot = self.rect(e).center();
+        let rot = Rot2::from_angle(delta.to_radians());
+        for id in self.with_descendants(&[e]) {
+            if id != e
+                && let Some(t) = self.transforms.get_mut(id)
+            {
+                let c = t.rect().center();
+                let moved = pivot + rot * (c - pivot) - c;
+                t.x += moved.x;
+                t.y += moved.y;
+            }
+            let turned = normalize_degrees(self.rotations.get(id).map_or(0.0, |r| r.0) + delta);
+            if turned == 0.0 {
+                self.rotations.remove(id);
+            } else {
+                self.rotations.insert(id, Rotation(turned));
+            }
+        }
+    }
+
     pub fn visible(&self, e: Entity) -> bool {
         !self.hidden.has(e)
     }
@@ -143,6 +202,13 @@ impl World {
             serde_json::from_value(value).map_err(|e| e.to_string())
         }
     }
+}
+
+/// Wraps degrees into -180..=180, rounding off float noise.
+pub fn normalize_degrees(d: f32) -> f32 {
+    let d = (d + 180.0).rem_euclid(360.0) - 180.0;
+    let d = if d == -180.0 { 180.0 } else { d };
+    (d * 1000.0).round() / 1000.0
 }
 
 /// The pre-ECS file format: one flat struct per shape.
@@ -252,6 +318,21 @@ mod tests {
         assert_eq!(w.texts.get(2).unwrap().content, "hi");
         assert!(!w.strokes.has(2) && !w.visible(2));
         assert_eq!(w.parents.get(2), Some(&Parent(1)));
+    }
+
+    #[test]
+    fn rotating_a_frame_turns_its_children_about_its_centre() {
+        let mut w = World::default();
+        let f = w.spawn_shape(ShapeKind::Frame, Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0)));
+        let c = w.spawn_shape(ShapeKind::Rect, Rect::from_min_size(pos2(70.0, 40.0), vec2(20.0, 20.0)));
+        w.parents.insert(c, Parent(f));
+        w.set_rotation(f, 90.0);
+        assert_eq!(w.rotations.get(c), Some(&Rotation(90.0)));
+        let centre = w.rect(c).center();
+        assert!((centre - pos2(50.0, 80.0)).length() < 1e-3);
+        w.set_rotation(f, 0.0);
+        assert!(!w.rotations.has(c) && !w.rotations.has(f));
+        assert!((w.rect(c).center() - pos2(80.0, 50.0)).length() < 1e-3);
     }
 
     #[test]

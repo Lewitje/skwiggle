@@ -1,6 +1,8 @@
 //! Render systems: fit text entities to their content, then paint every visible entity.
 
-use eframe::egui::{self, Color32, FontId, Painter, Rect, Vec2};
+use eframe::egui::{self, Color32, FontId, Painter, Pos2, Rect, Vec2, emath::Rot2};
+use eframe::egui::layers::ShapeIdx;
+use eframe::epaint::{Mesh, Shape, Tessellator};
 
 use crate::components::color;
 use crate::ecs::Entity;
@@ -40,10 +42,31 @@ pub fn render(
             None => clip,
         };
         let r = to_screen(world.rect(e));
-        if !clip.is_positive() || !r.intersects(clip) {
+        if !clip.is_positive() || !to_screen(world.bounds(e)).intersects(clip) {
             continue;
         }
         let painter = &painter.with_clip_rect(clip);
+        let angle = world.angle(e);
+        let first = painter.add(Shape::Noop);
+        paint_entity(world, painter, e, r, zoom, editing, cache);
+        if angle != 0.0 {
+            let end = painter.add(Shape::Noop);
+            rotate_shapes(painter, first.0 + 1..end.0, angle, r.center());
+        }
+    }
+}
+
+/// Paints one entity, unrotated, into screen rect `r`.
+fn paint_entity(
+    world: &World,
+    painter: &Painter,
+    e: Entity,
+    r: Rect,
+    zoom: f32,
+    editing: Option<Entity>,
+    cache: &mut PaintCache,
+) {
+    {
         let fill = world.fills.get(e).map(|f| &f.0);
 
         if let Some(text) = world.texts.get(e) {
@@ -53,7 +76,7 @@ pub fn render(
                 let galley = painter.layout(text.content.clone(), font, c, r.width());
                 painter.galley(r.min, galley, c);
             }
-            continue;
+            return;
         }
 
         let stroke = world
@@ -84,4 +107,40 @@ pub fn render(
             (_, None) => {}
         }
     }
+}
+
+/// Turns the painter's shapes in `range` by `angle` about `pivot`: text by its angle, the rest as meshes.
+fn rotate_shapes(painter: &Painter, range: std::ops::Range<usize>, angle: f32, pivot: Pos2) {
+    let ctx = painter.ctx();
+    let rot = Rot2::from_angle(angle);
+    let options = ctx.tessellation_options(|o| *o);
+    let tex_size = ctx.fonts(|f| f.font_image_size());
+    let mut tess = Tessellator::new(ctx.pixels_per_point(), options, tex_size, Vec::new());
+    ctx.graphics_mut(|g| {
+        let list = g.entry(painter.layer_id());
+        for i in range {
+            list.mutate_shape(ShapeIdx(i), |cs| {
+                let shape = std::mem::replace(&mut cs.shape, Shape::Noop);
+                cs.shape = match shape {
+                    Shape::Text(mut t) => {
+                        t.pos = pivot + rot * (t.pos - pivot);
+                        t.angle += angle;
+                        Shape::Text(t)
+                    }
+                    other => {
+                        let mut mesh = match &other {
+                            Shape::Rect(r) => r
+                                .brush
+                                .as_ref()
+                                .map_or_else(Mesh::default, |b| Mesh::with_texture(b.fill_texture_id)),
+                            _ => Mesh::default(),
+                        };
+                        tess.tessellate_shape(other, &mut mesh);
+                        mesh.rotate(rot, pivot);
+                        Shape::mesh(mesh)
+                    }
+                };
+            });
+        }
+    });
 }

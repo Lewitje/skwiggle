@@ -1,6 +1,6 @@
 //! Hit testing: which entity is under a world-space point.
 
-use eframe::egui::Pos2;
+use eframe::egui::{Pos2, emath::Rot2};
 
 use crate::ecs::Entity;
 use crate::world::World;
@@ -9,6 +9,8 @@ impl World {
     /// Whether `p` lands on `e`'s geometry.
     pub fn contains(&self, e: Entity, p: Pos2) -> bool {
         let r = self.rect(e);
+        // Test in the shape's own unrotated frame.
+        let p = r.center() + Rot2::from_angle(-self.angle(e)) * (p - r.center());
         if !self.ellipses.has(e) {
             return r.contains(p);
         }

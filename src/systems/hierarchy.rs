@@ -39,8 +39,9 @@ impl World {
                 out.push((e, clip));
                 if let Some(frame) = w.frames.get(e) {
                     let inner = match (frame.clip, clip) {
-                        (true, Some(c)) => Some(c.intersect(w.rect(e))),
-                        (true, None) => Some(w.rect(e)),
+                        // Rotated frames clip to their axis-aligned bounds.
+                        (true, Some(c)) => Some(c.intersect(w.bounds(e))),
+                        (true, None) => Some(w.bounds(e)),
                         (false, c) => c,
                     };
                     walk(w, tree, Some(e), inner, out);

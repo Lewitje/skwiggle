@@ -33,6 +33,24 @@ impl Transform {
     }
 }
 
+/// Clockwise turn in degrees about the bounding box's centre.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Rotation(pub f32);
+
+/// The point that stays put when width or height is edited; each axis is 0 (start), 1 (middle) or 2 (end).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Anchor {
+    pub col: u8,
+    pub row: u8,
+}
+
+impl Anchor {
+    /// Fraction of a size change that shifts the position on each axis.
+    pub fn factor(self) -> (f32, f32) {
+        (self.col as f32 / 2.0, self.row as f32 / 2.0)
+    }
+}
+
 /// What the shape is filled with. Text only uses its solid color.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(from = "FillRepr")]

@@ -1,8 +1,8 @@
 //! The fill editor popup: solid color, gradient with draggable stops, or image.
 
 use eframe::egui::{
-    self, Button, Color32, DragValue, Popup, PopupCloseBehavior, Rect, Response, Sense, Stroke,
-    StrokeKind, Ui, Vec2, pos2, vec2,
+    self, Button, Color32, Popup, PopupCloseBehavior, Rect, Response, Sense, Stroke, StrokeKind,
+    Ui, Vec2, pos2, vec2,
 };
 use egui::widgets::color_picker::{self, Alpha};
 
@@ -10,6 +10,7 @@ use crate::components::color;
 use crate::paint::{
     Gradient, GradientKind, ImageFit, ImagePaint, Outline, Paint, PaintCache, Stop,
 };
+use crate::scrub::Scrub;
 
 const WIDTH: f32 = 260.0;
 
@@ -99,13 +100,8 @@ fn gradient_editor(ui: &mut Ui, g: &mut Gradient, cache: &mut PaintCache) {
         ui.selectable_value(&mut g.kind, GradientKind::Linear, "Linear");
         ui.selectable_value(&mut g.kind, GradientKind::Radial, "Radial");
         if g.kind == GradientKind::Linear {
-            ui.add(
-                DragValue::new(&mut g.angle)
-                    .suffix("°")
-                    .speed(1.0)
-                    .custom_parser(crate::calc::parse),
-            )
-            .on_hover_text("Angle");
+            ui.add(Scrub::new(&mut g.angle).suffix("°"))
+                .on_hover_text("Angle");
             g.angle = g.angle.rem_euclid(360.0);
         }
         if ui.button("⇄").on_hover_text("Reverse").clicked() {
@@ -171,7 +167,7 @@ fn gradient_editor(ui: &mut Ui, g: &mut Gradient, cache: &mut PaintCache) {
         let stop = &mut g.stops[selected];
         ui.label("Stop");
         ui.add(
-            DragValue::from_get_set(|v| {
+            Scrub::from_get_set(|v| {
                 if let Some(v) = v {
                     stop.pos = (v as f32 / 100.0).clamp(0.0, 1.0);
                 }
@@ -179,8 +175,7 @@ fn gradient_editor(ui: &mut Ui, g: &mut Gradient, cache: &mut PaintCache) {
             })
             .range(0.0..=100.0)
             .max_decimals(0)
-            .suffix("%")
-            .custom_parser(crate::calc::parse),
+            .suffix("%"),
         );
         let can_remove = g.stops.len() > 2;
         if ui.add_enabled(can_remove, Button::new("Remove")).clicked() {
@@ -237,7 +232,7 @@ fn image_editor(ui: &mut Ui, img: &mut ImagePaint, cache: &mut PaintCache) {
         ui.horizontal(|ui| {
             ui.label("Scale");
             ui.add(
-                DragValue::from_get_set(|v| {
+                Scrub::from_get_set(|v| {
                     if let Some(v) = v {
                         img.scale = (v as f32 / 100.0).max(0.01);
                     }
@@ -245,8 +240,7 @@ fn image_editor(ui: &mut Ui, img: &mut ImagePaint, cache: &mut PaintCache) {
                 })
                 .range(1.0..=1000.0)
                 .max_decimals(0)
-                .suffix("%")
-                .custom_parser(crate::calc::parse),
+                .suffix("%"),
             );
         });
     }
